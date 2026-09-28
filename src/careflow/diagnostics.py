@@ -50,6 +50,8 @@ class ConsistencyChecker:
         self.check_incident_ledger()
         self.check_signed_records()
         self.check_duplicate_active_reservations()
+        self.check_referral_consent_gate()
+        self.check_referral_snapshot_retention()
         chain = audit.verify_chain(self.connection, self.clinic_id)
         if not chain["ok"]:
             self.add("audit.chain_mismatch", "critical", "clinic", self.clinic_id,
@@ -219,6 +221,36 @@ class ConsistencyChecker:
                      {"appointments": [row["first_id"], row["second_id"]],
                       "intervals": [[row["starts_at"], row["first_end"]], [row["second_start"], row["second_end"]]]},
                      "联系诊所排班负责人核对是否为合法协同服务或重复占用。")
+
+    def check_referral_consent_gate(self) -> None:
+        rows = self.connection.execute(
+            "SELECT r.id,r.state,r.expires_at,r.consent_id,c.state AS consent_state,c.expires_at AS consent_expires_at,"
+            "r.patient_id,r.destination_clinic_id "
+            "FROM referrals r LEFT JOIN consents c ON c.id=r.consent_id WHERE r.source_clinic_id=? "
+            "AND r.state IN ('offered','accepted') ORDER BY r.id", (self.clinic_id,)).fetchall()
+        for row in rows:
+            lapsed = (row["consent_state"] is None or row["consent_state"] != "granted")
+            if not lapsed and row["consent_expires_at"] and row["consent_expires_at"] <= self.as_of:
+                self.add("referral.consent_lapsed", "high", "referral", row["id"],
+                         {"state": row["state"], "consent_id": row["consent_id"],
+                          "consent_expires_at": row["consent_expires_at"], "destination_clinic_id": row["destination_clinic_id"]},
+                         "专项授权已撤回或到期，应由来源诊所立即吊销交接并确认快照不可继续访问。")
+            elif row["expires_at"] and row["expires_at"] <= self.as_of:
+                self.add("referral.expiry_due", "medium", "referral", row["id"],
+                         {"state": row["state"], "expires_at": row["expires_at"],
+                          "destination_clinic_id": row["destination_clinic_id"]},
+                         "交接已超过有效期限，运行过期处理并确认未读快照已清除、访问流水仍保留。")
+
+    def check_referral_snapshot_retention(self) -> None:
+        rows = self.connection.execute(
+            "SELECT r.id,r.state,r.expires_at,count(a.id) AS access_count FROM referrals r "
+            "LEFT JOIN referral_accesses a ON a.referral_id=r.id WHERE r.destination_clinic_id=? "
+            "GROUP BY r.id HAVING r.state IN ('revoked','expired','declined') AND r.snapshot_json IS NOT NULL "
+            "ORDER BY r.id", (self.clinic_id,)).fetchall()
+        for row in rows:
+            self.add("referral.snapshot_retained", "high", "referral", row["id"],
+                     {"state": row["state"], "expires_at": row["expires_at"], "access_count": row["access_count"]},
+                     "终态交接仍保留快照正文；立即清除内容并核对访问流水与哈希链审计未被删除。")
 
 
 def clinic_diagnostics(connection, clinic_id: str, as_of: str) -> dict[str, Any]:

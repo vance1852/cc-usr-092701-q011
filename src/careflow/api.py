@@ -229,6 +229,36 @@ def create_handler(app: Careflow):
                 data = self.body()
                 return app.exports.export(clinic_id, actor_id, segments[1], data.get("sections", []),
                                           data.get("reason", ""), self.headers.get("Idempotency-Key", "")), 200
+            if self.command == "POST" and segments == ["referrals"]:
+                data = self.body()
+                return app.referrals.send(clinic_id, actor_id, data.get("destination_clinic_id", ""),
+                                          data.get("patient_id", ""), data.get("purpose", ""),
+                                          data.get("sections", []), data.get("consent_id", ""),
+                                          data.get("expires_at", ""), self.headers.get("Idempotency-Key", ""),
+                                          purpose_detail=data.get("purpose_detail")), 201
+            if self.command == "GET" and segments == ["referrals", "incoming"]:
+                params = parse_qs(path.query)
+                return app.referrals.list_incoming(clinic_id, actor_id, state=params.get("state", [None])[0]), 200
+            if self.command == "GET" and segments == ["referrals", "outgoing"]:
+                params = parse_qs(path.query)
+                return app.referrals.list_outgoing(clinic_id, actor_id, state=params.get("state", [None])[0]), 200
+            if self.command == "GET" and len(segments) == 3 and segments[0] == "referrals" and segments[2] == "snapshot":
+                params = parse_qs(path.query)
+                sections = params.get("sections", [None])[0]
+                requested = [item for item in sections.split(",") if item] if sections else None
+                return app.referrals.open_snapshot(clinic_id, actor_id, segments[1], sections=requested), 200
+            if self.command == "GET" and len(segments) == 3 and segments[0] == "referrals" and segments[2] == "accesses":
+                return app.referrals.access_log(clinic_id, actor_id, segments[1]), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "referrals" and segments[2] == "respond":
+                data = self.body()
+                return app.referrals.respond(clinic_id, actor_id, segments[1], data.get("decision", ""),
+                                              data.get("expected_version", 0), assignee_id=data.get("assignee_id"),
+                                              reason=data.get("reason")), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "referrals" and segments[2] == "revoke":
+                data = self.body()
+                return app.referrals.revoke(clinic_id, actor_id, segments[1], data.get("reason", "")), 200
+            if self.command == "GET" and len(segments) == 2 and segments[0] == "referrals":
+                return app.referrals.get(clinic_id, actor_id, segments[1]), 200
             if self.command == "GET" and segments == ["audit", "verify"]:
                 return app.verify_audit(clinic_id, actor_id), 200
             if self.command == "GET" and segments == ["audit", "diagnostics"]:

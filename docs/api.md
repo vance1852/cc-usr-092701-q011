@@ -43,6 +43,21 @@
 
 `POST /patients/{patient_id}/export` 只在存在有效数据导出授权时返回明确选择的章节。导出字段采用白名单，联系方式密文、凭据和内部合并字段不会导出；相同幂等请求得到相同内容摘要。`GET /reports/daily`、`appointments`、`incidents` 和 `overdue-milestones` 仅返回运营汇总或经岗位授权的工作队列。
 
+## 跨诊所转诊交接
+
+转诊交接以患者的**专项披露授权**（授权用途 `referral_disclosure`）为依据，把授权范围内的章节快照交给另一家诊所，而不是复制病历原文：
+
+- `POST /referrals`（需 `Idempotency-Key`）由来源诊所临床岗位发起，须指定 `destination_clinic_id`、`patient_id`、`purpose`、`sections`、`consent_id` 与 `expires_at`。交接有效期必须晚于当前时间且不晚于专项授权到期时间；章节取自与导出相同的白名单，联系方式密文等内部字段不会进入快照。
+- `GET /referrals/incoming`、`GET /referrals/outgoing` 由来源/接收诊所分别查看本侧交接清单，只返回元数据（含 `snapshot_digest` 与 `snapshot_available`），不返回快照正文。
+- `POST /referrals/{id}/respond` 由接收诊所医生或负责人提交 `decision=accept|decline`（带 `expected_version`）。拒绝须提供 `reason`；接受时可指定 `assignee_id`，未指定则为操作者本人。**接受前接收诊所不存在该患者的任何普通档案**；接受瞬间才建立在诊档案（`external_ref` 形如 `ref:{referral_id}`）。
+- `GET /referrals/{id}` 查看交接元数据；`GET /referrals/{id}/accesses` 查看该交接的逐次访问流水。
+- `GET /referrals/{id}/snapshot` 只在接受后、且仅由指定接收医生（或本所负责人）读取授权章节，可用 `?sections=` 进一步取子集，但不能超出授权章节。
+- `POST /referrals/{id}/revoke` 由来源诊所在患者撤回授权或要求停止披露时吊销。
+
+交接快照在发送时固化。之后来源记录变化不会静默扩大披露：读取快照时逐章节与来源现状比对，返回 `source_changed` 与 `changed_sections`，并在 `notice` 中提示由来源重新发起交接。患者撤回专项授权（`POST /consents/{id}/withdraw`，或签署更新版本替代旧授权）或交接过期后，快照内容立即销毁且不能继续访问；已接受交接在到期/撤回时惰性或经 `referrals.expire_due` 批量落入终态。无论终态如何，`referral_accesses` 逐次访问流水和来源、接收两侧哈希链审计均永久保留。重复发起相同交接（相同来源诊所与幂等编号、相同内容）返回原编号与原 `snapshot_digest`；相同编号但内容不同返回冲突。
+
+交接状态：待回应 → 已接受 / 已拒绝；待回应或已接受 → 已吊销 / 已过期。已拒绝、已吊销、已过期为终态，终态下快照正文不可保留、不可读取。
+
 ## 主要状态
 
 - 计划：草稿 → 提议 → 生效；可暂停和恢复，完成或取消后不能重新激活。

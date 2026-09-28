@@ -11,7 +11,7 @@ from typing import Iterator
 
 from .errors import StorageFailure
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -347,6 +347,47 @@ CREATE TABLE IF NOT EXISTS incident_events (
     sequence INTEGER NOT NULL,
     UNIQUE(incident_id,sequence)
 );
+CREATE TABLE IF NOT EXISTS referrals (
+    id TEXT PRIMARY KEY,
+    source_clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    destination_clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    patient_id TEXT NOT NULL REFERENCES patients(id),
+    accepted_patient_id TEXT REFERENCES patients(id),
+    consent_id TEXT NOT NULL REFERENCES consents(id),
+    assignee_id TEXT REFERENCES staff(id),
+    purpose TEXT NOT NULL,
+    purpose_detail TEXT,
+    sections_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('offered','accepted','declined','revoked','expired')),
+    snapshot_json TEXT,
+    snapshot_baseline_json TEXT NOT NULL,
+    snapshot_digest TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES staff(id),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    responded_by TEXT REFERENCES staff(id),
+    responded_at TEXT,
+    decline_reason TEXT,
+    revoked_at TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(source_clinic_id,idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS referrals_destination_state ON referrals(destination_clinic_id,state,created_at);
+CREATE INDEX IF NOT EXISTS referrals_patient_state ON referrals(patient_id,state);
+CREATE TABLE IF NOT EXISTS referral_accesses (
+    id TEXT PRIMARY KEY,
+    referral_id TEXT NOT NULL REFERENCES referrals(id),
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    patient_id TEXT REFERENCES patients(id),
+    accessor_id TEXT NOT NULL REFERENCES staff(id),
+    sections_json TEXT NOT NULL,
+    snapshot_digest TEXT NOT NULL,
+    source_changed INTEGER NOT NULL CHECK(source_changed IN (0,1)),
+    accessed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS referral_accesses_referral ON referral_accesses(referral_id,accessed_at);
 CREATE TABLE IF NOT EXISTS idempotency (
     scope TEXT NOT NULL,
     key TEXT NOT NULL,

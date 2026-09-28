@@ -37,11 +37,13 @@ class Careflow:
         from .exports import PatientExportService
         from .milestones import MilestoneService
         from .clinical_flags import ClinicalFlagService
+        from .referrals import ReferralService
         self.supplies = SupplyService(self.db, self.clock)
         self.reports = ReportService(self.db, self.clock)
         self.exports = PatientExportService(self.db, self.clock)
         self.milestones = MilestoneService(self.db, self.clock)
         self.clinical_flags = ClinicalFlagService(self.db, self.clock)
+        self.referrals = ReferralService(self.db, self.clock)
 
     def now(self) -> str:
         return timestamp(self.clock.now())
@@ -271,7 +273,7 @@ class Careflow:
 
     def grant_consent(self, clinic_id: str, actor_id: str, patient_id: str, purpose: str,
                       revision: int, text_digest: str, *, expires_at: str | None = None) -> dict[str, Any]:
-        purpose = choice(purpose, "授权用途", {"clinical_care", "aesthetic_procedure", "weight_program", "followup_contact", "data_export"})
+        purpose = choice(purpose, "授权用途", {"clinical_care", "aesthetic_procedure", "weight_program", "followup_contact", "data_export", "referral_disclosure"})
         if not isinstance(revision, int) or revision < 1:
             raise ValidationError("授权版本必须为正整数")
         if len(text_digest) != 64 or any(c not in "0123456789abcdef" for c in text_digest):
@@ -294,8 +296,13 @@ class Careflow:
             ).fetchone()
             if previous and revision <= previous["revision"]:
                 raise Conflict("新授权版本必须高于当前版本")
+            referrals_lapsed = 0
             if previous and previous["state"] == "granted":
                 connection.execute("UPDATE consents SET state='expired' WHERE id=?", (previous["id"],))
+                # 旧版专项授权被新版替代：引用旧授权的开放交接立即到期。
+                if previous["purpose"] == "referral_disclosure":
+                    referrals_lapsed = self.referrals.lapse_for_replaced_consent(
+                        connection, previous, now, actor_id)
             connection.execute(
                 "INSERT INTO consents(id,patient_id,purpose,revision,text_digest,state,effective_at,expires_at,recorded_by,supersedes,created_at) "
                 "VALUES(?,?,?,?,?,'granted',?,?,?,?,?)",
@@ -303,7 +310,9 @@ class Careflow:
                  previous["id"] if previous else None, now))
             audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=patient_id,
                                aggregate_type="consent", aggregate_id=consent_id, action="consent.granted",
-                               occurred_at=now, payload={"purpose": purpose, "revision": revision, "digest": text_digest})
+                               occurred_at=now, payload={"purpose": purpose, "revision": revision,
+                                                         "digest": text_digest,
+                                                         "referrals_lapsed": referrals_lapsed})
         return {"id": consent_id, "patient_id": patient_id, "purpose": purpose, "revision": revision,
                 "text_digest": text_digest, "state": "granted", "effective_at": now, "expires_at": expires}
 
@@ -325,8 +334,14 @@ class Careflow:
             audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=row["patient_id"],
                                aggregate_type="consent", aggregate_id=consent_id, action="consent.withdrawn",
                                occurred_at=now, payload={"purpose": row["purpose"], "reason": reason})
+            referrals_revoked = 0
+            if row["purpose"] == "referral_disclosure":
+                referrals_revoked = self.referrals.revoke_for_consent(connection, row, now, actor_id, reason)
             self._pause_plans_for_withdrawal(connection, row, now, actor_id)
-        return {"id": consent_id, "state": "withdrawn", "withdrawn_at": now, "replayed": False}
+        result = {"id": consent_id, "state": "withdrawn", "withdrawn_at": now, "replayed": False}
+        if row["purpose"] == "referral_disclosure":
+            result["referrals_revoked"] = referrals_revoked
+        return result
 
     def _pause_plans_for_withdrawal(self, connection, consent, now: str, actor_id: str) -> int:
         dependent_kind = "aesthetic" if consent["purpose"] == "aesthetic_procedure" else "weight" if consent["purpose"] == "weight_program" else None
