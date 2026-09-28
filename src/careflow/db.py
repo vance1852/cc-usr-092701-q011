@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS consents (
     expires_at TEXT,
     recorded_by TEXT NOT NULL REFERENCES staff(id),
     supersedes TEXT REFERENCES consents(id),
+    scope_json TEXT,
     created_at TEXT NOT NULL,
     UNIQUE(patient_id,purpose,revision)
 );
@@ -371,6 +372,45 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS audit_patient_sequence ON audit_events(patient_id,sequence);
 CREATE INDEX IF NOT EXISTS audit_aggregate ON audit_events(aggregate_type,aggregate_id,sequence);
+CREATE TABLE IF NOT EXISTS referrals (
+    id TEXT PRIMARY KEY,
+    source_clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    destination_clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    source_patient_id TEXT NOT NULL REFERENCES patients(id),
+    created_by TEXT NOT NULL REFERENCES staff(id),
+    designated_staff_id TEXT REFERENCES staff(id),
+    consent_id TEXT NOT NULL REFERENCES consents(id),
+    purpose TEXT NOT NULL,
+    note TEXT,
+    sections_json TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    source_digest TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    idempotency_key TEXT,
+    state TEXT NOT NULL CHECK(state IN ('pending','accepted','declined','superseded')),
+    responded_by TEXT REFERENCES staff(id),
+    responded_at TEXT,
+    decline_reason TEXT,
+    sealed_at TEXT,
+    seal_reason TEXT CHECK(seal_reason IS NULL OR seal_reason IN ('consent_withdrawn','expired')),
+    superseded_by TEXT REFERENCES referrals(id),
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS referrals_destination ON referrals(destination_clinic_id,state,created_at);
+CREATE INDEX IF NOT EXISTS referrals_source ON referrals(source_clinic_id,source_patient_id,created_at);
+CREATE INDEX IF NOT EXISTS referrals_consent ON referrals(consent_id,sealed_at);
+CREATE INDEX IF NOT EXISTS referrals_open_hash ON referrals(request_hash,state);
+CREATE TABLE IF NOT EXISTS referral_access (
+    id TEXT PRIMARY KEY,
+    referral_id TEXT NOT NULL REFERENCES referrals(id),
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    staff_id TEXT NOT NULL REFERENCES staff(id),
+    sections_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS referral_access_referral ON referral_access(referral_id,created_at);
 """
 
 
@@ -399,6 +439,9 @@ class Database:
         try:
             with self.session() as connection:
                 connection.executescript(SCHEMA)
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(consents)").fetchall()}
+                if "scope_json" not in columns:
+                    connection.execute("ALTER TABLE consents ADD COLUMN scope_json TEXT")
                 connection.execute(
                     "INSERT INTO schema_meta(key,value) VALUES('schema_version',?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

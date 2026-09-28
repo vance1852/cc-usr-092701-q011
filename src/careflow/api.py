@@ -129,8 +129,8 @@ def create_handler(app: Careflow):
                 data = self.body()
                 return app.grant_consent(clinic_id, actor_id, segments[1], data.get("purpose", ""),
                                          data.get("revision", 0), data.get("text_digest", ""),
-                                         expires_at=data.get("expires_at")), 201
-            if len(segments) == 4 and segments[0] == "consents" and segments[2] == "withdraw" and self.command == "POST":
+                                         expires_at=data.get("expires_at"), scope=data.get("scope")), 201
+            if len(segments) == 3 and segments[0] == "consents" and segments[2] == "withdraw" and self.command == "POST":
                 return app.withdraw_consent(clinic_id, actor_id, segments[1], self.body().get("reason", "")), 200
             if len(segments) == 3 and segments[0] == "patients" and segments[2] == "assessments" and self.command == "POST":
                 data = self.body()
@@ -229,6 +229,32 @@ def create_handler(app: Careflow):
                 data = self.body()
                 return app.exports.export(clinic_id, actor_id, segments[1], data.get("sections", []),
                                           data.get("reason", ""), self.headers.get("Idempotency-Key", "")), 200
+            if self.command == "POST" and len(segments) == 3 and segments[0] == "patients" and segments[2] == "referrals":
+                data = self.body()
+                return app.referrals.create_referral(
+                    clinic_id, actor_id, segments[1], data.get("destination_clinic_id", ""),
+                    data.get("designated_staff_id", ""), data.get("purpose", ""), data.get("sections", []),
+                    data.get("expires_at", ""), data.get("consent_id", ""), note=data.get("note"),
+                    idempotency_key=self.headers.get("Idempotency-Key") or None), 201
+            if self.command == "GET" and segments == ["referrals"]:
+                params = parse_qs(path.query)
+                return app.referrals.list_referrals(clinic_id, actor_id,
+                                                    params.get("direction", ["incoming"])[0],
+                                                    patient_id=params.get("patient_id", [None])[0]), 200
+            if self.command == "POST" and segments == ["referrals", "expire"]:
+                data = self.body()
+                return app.referrals.expire_referrals(clinic_id, actor_id, limit=data.get("limit", 200)), 200
+            if len(segments) == 2 and segments[0] == "referrals" and self.command == "GET":
+                return app.referrals.get_referral(clinic_id, actor_id, segments[1]), 200
+            if len(segments) == 3 and segments[0] == "referrals" and segments[2] in {"accept", "decline"} and self.command == "POST":
+                data = self.body()
+                return app.referrals.respond_referral(clinic_id, actor_id, segments[1], segments[2],
+                                                      data.get("expected_version", 0),
+                                                      decline_reason=data.get("decline_reason")), 200
+            if len(segments) == 3 and segments[0] == "referrals" and segments[2] == "refresh" and self.command == "POST":
+                data = self.body()
+                return app.referrals.refresh_referral(clinic_id, actor_id, segments[1], data.get("expires_at", ""),
+                                                      idempotency_key=self.headers.get("Idempotency-Key") or None), 201
             if self.command == "GET" and segments == ["audit", "verify"]:
                 return app.verify_audit(clinic_id, actor_id), 200
             if self.command == "GET" and segments == ["audit", "diagnostics"]:

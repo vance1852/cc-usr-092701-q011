@@ -12,6 +12,7 @@ from .clock import Clock, SystemClock
 from .db import Database, decode_json, encode_json
 from .errors import Conflict, Forbidden, NotFound, ValidationError
 from .ids import new_id, require_id, require_idempotency_key
+from .referrals import REFERRAL_SECTIONS
 from .security import Principal, authorize, hash_token, principal_for, verify_token
 from .validation import (
     calendar_date,
@@ -37,11 +38,13 @@ class Careflow:
         from .exports import PatientExportService
         from .milestones import MilestoneService
         from .clinical_flags import ClinicalFlagService
+        from .referrals import ReferralService
         self.supplies = SupplyService(self.db, self.clock)
         self.reports = ReportService(self.db, self.clock)
         self.exports = PatientExportService(self.db, self.clock)
         self.milestones = MilestoneService(self.db, self.clock)
         self.clinical_flags = ClinicalFlagService(self.db, self.clock)
+        self.referrals = ReferralService(self.db, self.clock)
 
     def now(self) -> str:
         return timestamp(self.clock.now())
@@ -270,12 +273,22 @@ class Careflow:
         return {"source_id": source_id, "target_id": target_id, "state": "merged", "merged_at": now}
 
     def grant_consent(self, clinic_id: str, actor_id: str, patient_id: str, purpose: str,
-                      revision: int, text_digest: str, *, expires_at: str | None = None) -> dict[str, Any]:
-        purpose = choice(purpose, "授权用途", {"clinical_care", "aesthetic_procedure", "weight_program", "followup_contact", "data_export"})
+                      revision: int, text_digest: str, *, expires_at: str | None = None,
+                      scope: list[str] | None = None) -> dict[str, Any]:
+        purpose = choice(purpose, "授权用途", {"clinical_care", "aesthetic_procedure", "weight_program", "followup_contact", "data_export", "referral_disclosure"})
         if not isinstance(revision, int) or revision < 1:
             raise ValidationError("授权版本必须为正整数")
         if len(text_digest) != 64 or any(c not in "0123456789abcdef" for c in text_digest):
             raise ValidationError("授权文本摘要必须为 SHA-256")
+        scope_sections: list[str] | None = None
+        if purpose == "referral_disclosure":
+            if not isinstance(scope, list) or not scope:
+                raise ValidationError("转诊专项授权必须明确至少一个资料章节")
+            scope_sections = sorted({choice(item, "授权资料章节", REFERRAL_SECTIONS) for item in scope})
+            if len(scope_sections) != len(set(scope)):
+                raise ValidationError("授权资料章节不能重复")
+        elif scope:
+            raise ValidationError("仅转诊专项授权可以指定资料章节")
         now = self.now()
         expires = timestamp(expires_at, "到期时间") if expires_at else None
         if expires and parsed_timestamp(expires) <= parsed_timestamp(now):
@@ -297,15 +310,17 @@ class Careflow:
             if previous and previous["state"] == "granted":
                 connection.execute("UPDATE consents SET state='expired' WHERE id=?", (previous["id"],))
             connection.execute(
-                "INSERT INTO consents(id,patient_id,purpose,revision,text_digest,state,effective_at,expires_at,recorded_by,supersedes,created_at) "
-                "VALUES(?,?,?,?,?,'granted',?,?,?,?,?)",
+                "INSERT INTO consents(id,patient_id,purpose,revision,text_digest,state,effective_at,expires_at,recorded_by,supersedes,scope_json,created_at) "
+                "VALUES(?,?,?,?,?,'granted',?,?,?,?,?,?)",
                 (consent_id, patient_id, purpose, revision, text_digest, now, expires, actor_id,
-                 previous["id"] if previous else None, now))
+                 previous["id"] if previous else None, encode_json(scope_sections) if scope_sections is not None else None, now))
             audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=patient_id,
                                aggregate_type="consent", aggregate_id=consent_id, action="consent.granted",
-                               occurred_at=now, payload={"purpose": purpose, "revision": revision, "digest": text_digest})
+                               occurred_at=now, payload={"purpose": purpose, "revision": revision, "digest": text_digest,
+                                                         "scope": scope_sections})
         return {"id": consent_id, "patient_id": patient_id, "purpose": purpose, "revision": revision,
-                "text_digest": text_digest, "state": "granted", "effective_at": now, "expires_at": expires}
+                "text_digest": text_digest, "state": "granted", "effective_at": now, "expires_at": expires,
+                "scope": scope_sections}
 
     def withdraw_consent(self, clinic_id: str, actor_id: str, consent_id: str, reason: str) -> dict[str, Any]:
         reason = text(reason, "撤回原因", maximum=600)
@@ -326,7 +341,14 @@ class Careflow:
                                aggregate_type="consent", aggregate_id=consent_id, action="consent.withdrawn",
                                occurred_at=now, payload={"purpose": row["purpose"], "reason": reason})
             self._pause_plans_for_withdrawal(connection, row, now, actor_id)
-        return {"id": consent_id, "state": "withdrawn", "withdrawn_at": now, "replayed": False}
+            sealed = 0
+            if row["purpose"] == "referral_disclosure":
+                from .referrals import seal_referrals_for_consent
+                sealed = seal_referrals_for_consent(connection, row, now, actor_id)
+        result = {"id": consent_id, "state": "withdrawn", "withdrawn_at": now, "replayed": False}
+        if row["purpose"] == "referral_disclosure":
+            result["referrals_sealed"] = sealed
+        return result
 
     def _pause_plans_for_withdrawal(self, connection, consent, now: str, actor_id: str) -> int:
         dependent_kind = "aesthetic" if consent["purpose"] == "aesthetic_procedure" else "weight" if consent["purpose"] == "weight_program" else None

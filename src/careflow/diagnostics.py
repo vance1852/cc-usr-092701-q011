@@ -50,6 +50,7 @@ class ConsistencyChecker:
         self.check_incident_ledger()
         self.check_signed_records()
         self.check_duplicate_active_reservations()
+        self.check_referral_seals()
         chain = audit.verify_chain(self.connection, self.clinic_id)
         if not chain["ok"]:
             self.add("audit.chain_mismatch", "critical", "clinic", self.clinic_id,
@@ -204,6 +205,23 @@ class ConsistencyChecker:
             self.add("encounter.signature_mismatch", "high", "encounter", row["id"],
                      {"patient_id": row["patient_id"], "state": row["state"], "signed_by": row["signed_by"],
                       "signed_at": row["signed_at"], "version": row["version"]}, "保留就诊原文并由临床负责人复核签署凭据。")
+
+    def check_referral_seals(self) -> None:
+        rows = self.connection.execute(
+            "SELECT r.id,r.source_clinic_id,r.destination_clinic_id,r.state,r.expires_at,c.state AS consent_state,"
+            "c.expires_at AS consent_expires_at "
+            "FROM referrals r LEFT JOIN consents c ON c.id=r.consent_id "
+            "WHERE r.sealed_at IS NULL AND r.state IN ('pending','accepted') "
+            "AND ((r.source_clinic_id=? OR r.destination_clinic_id=?) AND ("
+            "r.expires_at<=? OR c.state IS NULL OR c.state!='granted' OR c.expires_at<=?)) "
+            "ORDER BY r.expires_at,r.id",
+            (self.clinic_id, self.clinic_id, self.as_of, self.as_of)).fetchall()
+        for row in rows:
+            self.add("referral.seal_due", "high", "referral", row["id"],
+                     {"source_clinic_id": row["source_clinic_id"], "destination_clinic_id": row["destination_clinic_id"],
+                      "state": row["state"], "expires_at": row["expires_at"],
+                      "consent_state": row["consent_state"], "consent_expires_at": row["consent_expires_at"]},
+                     "立即运行交接封存：撤回或到期后未读章节必须不可继续访问，审计记录保留。")
 
     def check_duplicate_active_reservations(self) -> None:
         rows = self.connection.execute(

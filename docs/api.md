@@ -43,9 +43,23 @@
 
 `POST /patients/{patient_id}/export` 只在存在有效数据导出授权时返回明确选择的章节。导出字段采用白名单，联系方式密文、凭据和内部合并字段不会导出；相同幂等请求得到相同内容摘要。`GET /reports/daily`、`appointments`、`incidents` 和 `overdue-milestones` 仅返回运营汇总或经岗位授权的工作队列。
 
+## 跨诊所转诊交接
+
+转诊用于把一位需进一步评估的患者交接给另一家分院，全过程不复制自由病历文本，接收诊所在医生明确接受前不会产生该患者的任何档案。
+
+- `POST /patients/{patient_id}/referrals` 由来源临床岗位发起，需提供 `destination_clinic_id`、`designated_staff_id`、`purpose`（`further_assessment`、`specialty_consult`、`continuity_of_care`、`second_opinion`）、`sections`、`expires_at` 和一份 `referral_disclosure` 专项授权编号。可带 `Idempotency-Key`。
+- 专项授权通过 `POST /patients/{patient_id}/consents` 创建，`purpose` 为 `referral_disclosure` 且必须带 `scope` 章节白名单（`profile`、`assessments`、`plans`、`observations`、`clinical_flags`、`encounters`、`incidents`、`followups`）。交接章节必须被授权范围包含。
+- 发起即冻结白名单快照：联系方式密文、凭据与内部合并字段永不进入快照；重复发送相同交接（含相同幂等键或相同目的、章节、期限、授权组合）返回原编号与 `replayed: true`。
+- `GET /referrals?direction=incoming|outgoing` 查看信封列表；医生只看到指定给自己的入站交接，诊所负责人可查看全所队列。
+- `GET /referrals/{id}`：来源侧看交接状态；接收侧在 `pending` 或 `declined` 状态只看到信封，`accepted` 后才可读取授权范围内的快照章节。每次读取都写入双侧访问审计。
+- `POST /referrals/{id}/accept` 或 `/decline`（后者必须给 `decline_reason`）由被指定医生（或接收诊所负责人）凭 `expected_version` 答复。接受不创建接收诊所患者档案；接受前任何章节均不可读。
+- 快照固化在发起时点。来源记录随后变化时，`GET` 仅返回 `source_changed: true` 提示，不静默返回新内容；来源侧 `POST /referrals/{id}/refresh` 重新冻结最新数据并生成**新编号**，旧交接置为 `superseded`。
+- 患者撤回 `referral_disclosure` 授权、授权到期或交接过期后，交接立即封存（`sealed`）：从未被读取的章节从快照中删除且不可继续访问，已读取章节保留；全部访问与封存审计在两家诊所的哈希链中均保留。`POST /referrals/expire` 可批量清扫到期交接。
+
 ## 主要状态
 
 - 计划：草稿 → 提议 → 生效；可暂停和恢复，完成或取消后不能重新激活。
 - 预约：占位 → 确认 → 到诊 → 服务中 → 完成；取消和未到诊是独立终态。
 - 不良事件：已报告 → 分诊 → 观察 → 已解决 → 关闭。每次处置单独记录操作人和理由。
 - 耗材预留：预留 → 释放或核销。库存数量由收货、预留、释放和更正流水求和，不直接改写历史数量。
+- 转诊交接：待答复 → 已接受或已拒绝；来源侧重新获取时旧交接变为已取代。撤回授权或到期会封存交接（独立于答复状态），封存后未读章节不可访问。
